@@ -1,0 +1,24 @@
+[
+  {
+    "question": "What meal allowance do I get?",
+    "context": {"shift": "9-5"},
+    "expect_source": "benefits_9-5.pdf",
+    "forbid_source": "benefits_10-6.pdf",
+    "expect_all": ["200"]
+  },
+  {
+    "question": "What meal allowance do I get?",
+    "context": {"shift": "10-6"},
+    "expect_source": "benefits_10-6.pdf",
+    "forbid_source": "benefits_9-5.pdf"
+  },
+  {
+    "question": "How many casual leaves per year?",
+    "expect_clarify": "shift"
+  },
+  {
+    "question": "What is the company stock price?",
+    "context": {"shift": "9-5"},
+    "expect_not_found": true
+  }
+]

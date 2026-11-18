@@ -1,0 +1,4 @@
+chainlit
+chromadb
+pymupdf>=1.23.0
+ollama
