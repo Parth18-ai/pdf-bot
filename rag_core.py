@@ -24,14 +24,22 @@ OVERLAP_WORDS = 40
 VEC_K = 20
 BM25_K = 20
 FINAL_K = 8
-MAX_DISTANCE = 0.85
+MAX_DISTANCE = 1.25
 SAMPLE_WORDS = 500
 KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
 DB_PATH = os.getenv("DB_PATH", "rag_store")
 CACHE_DIR = os.getenv("CACHE_DIR", "index_cache")
-CACHE_VERSION = 1
-IGNORE_VALUES = {"all", "everyone", "any", "none", "n/a", "na", "general",
-                 "null", "unknown", "both", "all employees", ""}
+CACHE_VERSION = 4
+IGNORE_VALUES = {
+    "all", "everyone", "any", "none", "n/a", "na", "general",
+    "null", "unknown", "both", "all employees", ""
+}
+# Words that are policy/question topics, not user attributes like role/grade/plan
+TOPIC_NOISE_VALUES = {
+    "bonus", "bonuses", "leave", "leaves", "benefit", "benefits", "benifits",
+    "policy", "policies", "allowance", "allowances", "salary", "pay",
+    "overtime", "travel", "remote", "training", "stipend", "insurance"
+}
 STOPWORDS = set(
     "a an the and or of to in on for with is are was were be been do does did "
     "i me my we our you your it its this that these those what which who how "
@@ -99,9 +107,10 @@ def _time_key(match):
 
 def norm(value) -> str:
     v = re.sub(r"\s+", " ", str(value).lower().strip())
-    m = TIME_RE.fullmatch(v)
+    v_compact = re.sub(r"\s*-\s*", "-", v)
+    m = TIME_RE.fullmatch(v) or TIME_RE.fullmatch(v_compact)
     if m:
-        return _time_key(m) or v
+        return _time_key(m) or v_compact
     return v
 
 
@@ -148,7 +157,7 @@ def clean_scope(raw: dict) -> dict:
         if not isinstance(v, (str, int, float)):
             continue
         key = re.sub(r"[^a-z]+", "_", str(k).lower()).strip("_")
-        val = re.sub(r"\s+", " ", str(v).strip().lower())
+        val = norm(v)
         key = KEY_ALIASES.get(key, key)
         if key and val and val not in IGNORE_VALUES:
             out[key] = val
@@ -166,15 +175,22 @@ def _sample_text(text: str) -> str:
 
 
 def extract_doc_scope(name: str, text: str) -> dict:
-    # Robust filename-based hint pre-extraction for multi-PDF uploads
     filename_scope = {}
     lower_name = name.lower()
-    for loc in ["chennai", "mumbai", "bangalore", "delhi", "hyderabad", "pune", "remote", "onsite"]:
-        if loc in lower_name:
+    for loc in [
+        "chennai", "mumbai", "bangalore", "bengaluru", "delhi",
+        "hyderabad", "pune", "kolkata", "remote", "onsite"
+    ]:
+        if re.search(rf"(?<![a-z]){re.escape(loc)}(?![a-z])", lower_name):
             filename_scope["location"] = loc
-    for shift_keyword in ["9-5", "9to5", "night", "morning", "evening", "rotational", "general", "09:00-17:00"]:
+    for shift_keyword in [
+        "9-5", "9_5", "9to5", "night", "morning", "evening",
+        "rotational", "general", "09:00-17:00"
+    ]:
         if shift_keyword in lower_name:
-            filename_scope["shift"] = "09:00-17:00" if shift_keyword in ("9-5", "9to5") else shift_keyword
+            filename_scope["shift"] = (
+                "09:00-17:00" if shift_keyword in ("9-5", "9_5", "9to5") else shift_keyword
+            )
 
     system = (
         "You read parts of a document and decide which specific group it is "
@@ -188,9 +204,9 @@ def extract_doc_scope(name: str, text: str) -> dict:
     )
     user = f"File name: {name}\n\nText:\n{_sample_text(text)}"
     llm_scope = clean_scope(_llm_json(system, user))
-    
+
     filename_scope.update(llm_scope)
-    return filename_scope
+    return clean_scope(filename_scope)
 
 
 def known_options(docs: dict) -> dict:
@@ -202,6 +218,17 @@ def known_options(docs: dict) -> dict:
     return {k: sorted(v) for k, v in opts.items()}
 
 
+def _is_valid_user_value(key: str, val: str, known_vals: list) -> bool:
+    """Reject topic words (like 'bonus' or 'annual') unless explicitly in known options."""
+    if not val or val in IGNORE_VALUES:
+        return False
+    if any(same(val, x) for x in known_vals):
+        return True
+    if val in TOPIC_NOISE_VALUES:
+        return False
+    return True
+
+
 def extract_context(question: str, options: dict) -> dict:
     if not options:
         return {}
@@ -211,17 +238,21 @@ def extract_context(question: str, options: dict) -> dict:
         "The user asks questions about documents. The documents come in versions "
         "for different groups.\n"
         f"Known groups: {json.dumps(options)}\n"
-        "Extract which of these the user says about THEMSELVES in their message. "
-        "Only include an attribute if the message clearly states it. Never guess. "
+        "Extract ONLY attributes the user explicitly states about THEMSELVES "
+        "(such as their shift or location). Do NOT extract topic words from the "
+        "question like 'bonus', 'leave', 'benefits', or 'annual' as a role/grade/plan. "
         "Use the exact value from the known list when it matches. "
         'Return ONLY JSON like {"shift": "9-5"}, or {} if nothing is stated.'
     )
     for k, v in _llm_json(system, question).items():
         k = str(k).lower().strip()
         if k in options and isinstance(v, (str, int, float)):
-            v = str(v).strip()
-            if v and v.lower() not in IGNORE_VALUES:
-                ctx[k] = next((o for o in options[k] if same(o, v)), v.lower())
+            raw_v = str(v).strip().lower()
+            matched_opt = next((o for o in options[k] if same(o, raw_v)), None)
+            if matched_opt:
+                ctx[k] = matched_opt
+            elif _is_valid_user_value(k, raw_v, options[k]):
+                ctx[k] = norm(raw_v)
 
     q = norm(question)
     for k, vals in options.items():
@@ -534,9 +565,10 @@ def build_prompt(question: str, hits: list, context: dict):
     )
     if context:
         rule = (
-            f"The user's situation: {scope_text(context)}. Use ONLY facts that apply "
-            "to this situation or to everyone. If a passage is written for a "
-            "different group, ignore it."
+            f"The user's situation: {scope_text(context)} "
+            f"(note: 09:00-17:00 is the same as 9-5). "
+            "Use facts from passages that match this situation or apply to everyone/general. "
+            "Only ignore a passage if it explicitly states a conflicting shift or location."
         )
     else:
         rule = "No special situation was given, so answer from the passages as they are."
@@ -544,10 +576,10 @@ def build_prompt(question: str, hits: list, context: dict):
     system = (
         "You answer questions using ONLY the numbered passages given.\n"
         f"{rule}\n"
-        "Be complete: if the passages list several items (benefits, steps, "
-        "amounts), include ALL of them. Copy numbers, names and dates exactly.\n"
+        "Be complete: if the passages list several items (allowances, insurance, leave, "
+        "perks, bonus, steps, amounts), include ALL of them. Copy numbers, names and dates exactly.\n"
         "Put the passage number like [1] after each fact you use.\n"
-        f"If the passages do not contain the answer, reply with exactly: {NOT_FOUND_TOKEN}"
+        f"If the passages truly have zero relevant information, reply with exactly: {NOT_FOUND_TOKEN}"
     )
     user = f"Passages:\n{passages}\n\nQuestion: {question}"
     return [{"role": "system", "content": system},
