@@ -29,12 +29,11 @@ SAMPLE_WORDS = 500
 KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
 DB_PATH = os.getenv("DB_PATH", "rag_store")
 CACHE_DIR = os.getenv("CACHE_DIR", "index_cache")
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 IGNORE_VALUES = {
     "all", "everyone", "any", "none", "n/a", "na", "general",
     "null", "unknown", "both", "all employees", ""
 }
-# Words that are policy/question topics, not user attributes like role/grade/plan
 TOPIC_NOISE_VALUES = {
     "bonus", "bonuses", "leave", "leaves", "benefit", "benefits", "benifits",
     "policy", "policies", "allowance", "allowances", "salary", "pay",
@@ -61,6 +60,39 @@ def get_collection(session_id: str = ""):
         name=_COLLECTION,
         metadata={"hnsw:space": "cosine"},
     )
+
+
+def sample_embeddings(collection, doc_ids: list, limit: int = 3) -> list:
+    if not doc_ids:
+        return []
+    try:
+        res = collection.get(
+            where={"doc_id": {"$in": doc_ids}},
+            limit=limit,
+            include=["embeddings", "documents", "metadatas"],
+        )
+    except Exception as e:
+        raise RagError(f"Could not read embeddings: {e}")
+
+    out = []
+    embeddings = res.get("embeddings")
+    if embeddings is None:
+        embeddings = []
+    for cid, emb, meta, doc in zip(
+        res.get("ids", []),
+        embeddings,
+        res.get("metadatas", []),
+        res.get("documents", []),
+    ):
+        vec = list(emb) if emb is not None else []
+        out.append({
+            "id": cid,
+            "dims": len(vec),
+            "preview": [round(float(x), 4) for x in vec[:8]],
+            "meta": meta or {},
+            "text": (doc or "")[:90].replace("\n", " "),
+        })
+    return out
 
 
 # --------------------- comparing values ("9-5" == "9 to 5") ---------------
@@ -219,7 +251,6 @@ def known_options(docs: dict) -> dict:
 
 
 def _is_valid_user_value(key: str, val: str, known_vals: list) -> bool:
-    """Reject topic words (like 'bonus' or 'annual') unless explicitly in known options."""
     if not val or val in IGNORE_VALUES:
         return False
     if any(same(val, x) for x in known_vals):
@@ -240,7 +271,7 @@ def extract_context(question: str, options: dict) -> dict:
         f"Known groups: {json.dumps(options)}\n"
         "Extract ONLY attributes the user explicitly states about THEMSELVES "
         "(such as their shift or location). Do NOT extract topic words from the "
-        "question like 'bonus', 'leave', 'benefits', or 'annual' as a role/grade/plan. "
+        "question like 'bonus', 'leave', 'benefits', 'travel', or 'annual' as a role/grade/plan/department. "
         "Use the exact value from the known list when it matches. "
         'Return ONLY JSON like {"shift": "9-5"}, or {} if nothing is stated.'
     )
@@ -517,19 +548,15 @@ def rrf_merge(rankings: list, k: int = 60) -> list:
     return [rid for rid, _ in scores.most_common()]
 
 
-def retrieve(collection, question: str, docs: dict, eligible: list) -> list:
-    if not eligible:
-        return []
+def _split_subquestions(question: str) -> list:
+    parts = [p.strip() for p in re.split(r"\b(?:and also|also|and)\b|[?;]", question, flags=re.IGNORECASE) if p.strip()]
+    return parts if len(parts) > 1 else [question]
 
-    records = {}
-    for d in eligible:
-        records.update(d["records"])
 
-    ids = [d["doc_id"] for d in eligible]
-    where = {"doc_id": {"$in": ids}}
+def _retrieve_single(collection, sub_q: str, docs: dict, records: dict, where: dict) -> list:
     try:
         res = collection.query(
-            query_texts=[question],
+            query_texts=[sub_q],
             n_results=min(VEC_K, len(records)),
             where=where,
         )
@@ -541,9 +568,9 @@ def retrieve(collection, question: str, docs: dict, eligible: list) -> list:
             vec_ids.append(cid)
             distance[cid] = dist
 
-    kw_ids = bm25_rank(question, list(records.values()), BM25_K)
-
+    kw_ids = bm25_rank(sub_q, list(records.values()), BM25_K)
     best = rrf_merge([vec_ids, kw_ids])[:FINAL_K]
+
     hits = []
     for cid in best:
         rec = records[cid]
@@ -555,6 +582,33 @@ def retrieve(collection, question: str, docs: dict, eligible: list) -> list:
             "scope": docs[rec["meta"]["doc_id"]]["scope"],
         })
     return hits
+
+
+def retrieve(collection, question: str, docs: dict, eligible: list) -> list:
+    if not eligible:
+        return []
+
+    records = {}
+    for d in eligible:
+        records.update(d["records"])
+
+    ids = [d["doc_id"] for d in eligible]
+    where = {"doc_id": {"$in": ids}}
+
+    sub_qs = _split_subquestions(question)
+    if len(sub_qs) == 1:
+        return _retrieve_single(collection, question, docs, records, where)
+
+    # Multi-part question: merge top hits across sub-questions so each part gets its source PDF
+    merged = []
+    seen_texts = set()
+    for sq in sub_qs:
+        for h in _retrieve_single(collection, sq, docs, records, where)[:4]:
+            key = (h["meta"]["doc_id"], h["meta"]["page"], h["text"][:80])
+            if key not in seen_texts:
+                seen_texts.add(key)
+                merged.append(h)
+    return merged[:FINAL_K]
 
 
 def build_prompt(question: str, hits: list, context: dict):
@@ -577,7 +631,7 @@ def build_prompt(question: str, hits: list, context: dict):
         "You answer questions using ONLY the numbered passages given.\n"
         f"{rule}\n"
         "Be complete: if the passages list several items (allowances, insurance, leave, "
-        "perks, bonus, steps, amounts), include ALL of them. Copy numbers, names and dates exactly.\n"
+        "perks, bonus, travel, steps, amounts), include ALL of them. Copy numbers, names and dates exactly.\n"
         "Put the passage number like [1] after each fact you use.\n"
         f"If the passages truly have zero relevant information, reply with exactly: {NOT_FOUND_TOKEN}"
     )
@@ -616,11 +670,25 @@ async def answer_stream(question: str, hits: list, context: dict, on_token) -> s
 
 
 def cited_sources(reply: str, hits: list) -> list:
+    """Return all hits cited via [n], plus any other hit whose key terms appear in the reply."""
     used = []
     for num in re.findall(r"\[(\d+)\]", reply):
         i = int(num) - 1
         if 0 <= i < len(hits) and hits[i] not in used:
             used.append(hits[i])
+
+    reply_words = set(re.findall(r"[a-z0-9]{3,}", reply.lower()))
+    for h in hits:
+        if h in used:
+            continue
+        passage_words = {
+            w for w in re.findall(r"[a-z0-9]{3,}", h["text"].lower())
+            if w not in STOPWORDS and w not in {"policy", "employees", "company", "written", "general"}
+        }
+        # If multiple significant words from a retrieved passage appear in the reply, include its source
+        if len(passage_words & reply_words) >= 3:
+            used.append(h)
+
     return used or hits[:1]
 
 
