@@ -2,6 +2,7 @@
 app.py - the Chainlit web interface (multi-PDF, scope-aware version)
 """
 
+import re
 import uuid
 
 import chainlit as cl
@@ -37,6 +38,11 @@ WELCOME = (
     "and I will answer **only from the PDFs that match you**.\n\n"
     "Commands: `/docs` · `/scope` · `/reset`"
 )
+
+COMMON_LOCATIONS = {
+    "pune", "chennai", "mumbai", "bangalore", "bengaluru",
+    "delhi", "hyderabad", "kolkata", "noida", "gurgaon", "remote", "onsite"
+}
 
 
 def is_pdf(element) -> bool:
@@ -162,12 +168,11 @@ async def on_message(message: cl.Message):
         return
 
     options = known_options(docs)
-    context = cl.user_session.get("context")
+    context = dict(cl.user_session.get("context") or {})
     pending = cl.user_session.get("pending")
     pending_key = cl.user_session.get("pending_key")
     skip_ask = False
 
-    # 2) Understand who the user is (with robust pending clarification fallback)
     if pending and question.lower() in ("all", "any", "skip"):
         question, skip_ask = pending, True
         cl.user_session.set("pending", None)
@@ -175,7 +180,6 @@ async def on_message(message: cl.Message):
     else:
         found = await cl.make_async(extract_context)(question, options)
         if not found and pending:
-            # Robust fallback matching when user replies to clarification prompt
             matched = False
             if pending_key and pending_key in options:
                 for v in options[pending_key]:
@@ -193,7 +197,7 @@ async def on_message(message: cl.Message):
                     if matched:
                         break
             if not found and pending_key:
-                found = {pending_key: question.lower()}
+                found = {pending_key: norm(question)}
 
         if found:
             context.update(found)
@@ -203,7 +207,17 @@ async def on_message(message: cl.Message):
             cl.user_session.set("pending", None)
             cl.user_session.set("pending_key", None)
 
-    # 3) Does any PDF cover what they said?
+    if "location" in options and "location" not in context:
+        known_locs = {norm(x) for x in options["location"]}
+        for word in re.findall(r"[a-z]{3,}", question.lower()):
+            if word in COMMON_LOCATIONS and word not in known_locs:
+                await cl.Message(
+                    content=f"⚠️ No uploaded PDF covers **location = {word}**.\n\n"
+                            f"Available locations: {', '.join(options['location'])}\n\n"
+                            "Try one of those or type `/reset`."
+                ).send()
+                return
+
     bad = unknown_values(options, context)
     if bad:
         k, v = bad[0]
@@ -213,11 +227,11 @@ async def on_message(message: cl.Message):
                     "Tell me the right one, or type `/reset`."
         ).send()
         context.pop(k, None)
+        cl.user_session.set("context", context)
         return
 
     eligible = eligible_docs(docs, context)
 
-    # 4) Search only the matching PDFs
     try:
         hits = await cl.make_async(retrieve)(collection, question, docs, eligible)
     except RagError as e:
@@ -230,7 +244,6 @@ async def on_message(message: cl.Message):
         ).send()
         return
 
-    # 5) Ask for clarification if top PDFs differ on unstated attributes
     amb = None if skip_ask else ambiguous_key(top_docs(hits, docs), context)
     if amb:
         key, values = amb
@@ -243,7 +256,6 @@ async def on_message(message: cl.Message):
         ).send()
         return
 
-    # 6) Stream the answer
     msg = cl.Message(content="")
 
     async def on_token(text: str):
@@ -255,13 +267,12 @@ async def on_message(message: cl.Message):
         await cl.Message(content=f"⚠️ {e}").send()
         return
 
-    if NOT_FOUND_TOKEN in reply:
+    if reply.strip().startswith(NOT_FOUND_TOKEN):
         await cl.Message(
             content="The matching PDFs don't seem to answer that question."
         ).send()
         return
 
-    # 7) Sources
     lines = []
     for h in cited_sources(reply, hits):
         snippet = h["text"][:150].replace("\n", " ")
